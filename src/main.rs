@@ -8,18 +8,18 @@
 
 use anyhow::{Context, Result};
 use chrono::TimeZone;
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use clap::Parser;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
-use rusqlite::types::ValueRef;
-use rusqlite::{Connection, Row};
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
 static TS_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -27,6 +27,16 @@ static TS_RE: LazyLock<Regex> = LazyLock::new(|| {
     // 2026-01-29T08_25_59+01_00  (underscores instead of colons)
     Regex::new(r"(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}[+-]\d{2}_\d{2})").unwrap()
 });
+
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 #[derive(Debug, Clone)]
 struct Workout {
@@ -40,6 +50,7 @@ struct Workout {
     name = "roudenn",
     about = "Extract workouts from a Gadgetbridge export"
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Path to the Gadgetbridge export directory (contains gadgetbridge.json, files/, database/, etc.)
     export_dir: PathBuf,
@@ -59,21 +70,56 @@ struct Args {
     /// Disable reading from GPX files (`files/*.gpx`)
     #[arg(long)]
     no_gpx: bool,
+
+    /// Emit debug diagnostics to stderr
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    DEBUG.store(args.debug, Ordering::Relaxed);
+    let export_dir = args.export_dir.display();
+    dlog!("debug=on export_dir={export_dir}");
+
     let mut workouts: Vec<Workout> = Vec::new();
 
+    let mut gpx_total = 0usize;
+    let mut gpx_known = 0usize;
     if !args.no_gpx {
-        workouts.extend(collect_from_gpx(&args.export_dir)?);
-    }
-    if !args.no_db {
-        workouts.extend(collect_from_db(&args.export_dir)?);
+        let gpx = collect_from_gpx(&args.export_dir)?;
+        gpx_total = gpx.len();
+        gpx_known = gpx.iter().filter(|w| w.duration.is_some()).count();
+        workouts.extend(gpx);
     }
 
+    let mut db_total = 0usize;
+    let mut db_known = 0usize;
+    if !args.no_db {
+        let db = collect_from_db(&args.export_dir)?;
+        db_total = db.len();
+        db_known = db.iter().filter(|w| w.duration.is_some()).count();
+        workouts.extend(db);
+    }
+
+    dlog!(
+        "collected gpx_total={gpx_total} gpx_known={gpx_known} db_total={db_total} db_known={db_known}"
+    );
+
     let merged = merge_by_start_minute(workouts);
+    let merged_total = merged.len();
+    let merged_unknown = merged.iter().filter(|w| w.duration.is_none()).count();
+    dlog!("merged_total={merged_total} merged_unknown={merged_unknown}");
+
+    for w in merged.iter().take(10) {
+        let start_s = w.start.to_rfc3339();
+        let dur_s = w
+            .duration
+            .map_or_else(|| "unknown".to_string(), format_duration);
+        let source = &w.source;
+        dlog!("merged_item start={start_s} dur={dur_s} source={source}");
+    }
 
     if merged.is_empty() {
         anyhow::bail!(
@@ -111,6 +157,15 @@ fn collect_from_gpx(export_dir: &Path) -> Result<Vec<Workout>> {
 
     let mut out = Vec::new();
 
+    let mut seen = 0usize;
+    let mut start_fail = 0usize;
+    let mut empty = 0usize;
+    let mut no_duration = 0usize;
+    let mut with_duration = 0usize;
+
+    let mut sample_empty = 0usize;
+    let mut sample_nodur = 0usize;
+
     for entry in WalkDir::new(&files_dir)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -118,9 +173,22 @@ fn collect_from_gpx(export_dir: &Path) -> Result<Vec<Workout>> {
         if !entry.file_type().is_file() {
             continue;
         }
+
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("gpx") {
             continue;
+        }
+
+        seen += 1;
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if size == 0 {
+            empty += 1;
+            if sample_empty < 5 {
+                let p = path.display();
+                dlog!("gpx_empty path={p}");
+                sample_empty += 1;
+            }
         }
 
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -128,6 +196,7 @@ fn collect_from_gpx(export_dir: &Path) -> Result<Vec<Workout>> {
         };
 
         let Some(start) = parse_start_from_filename(file_name) else {
+            start_fail += 1;
             continue;
         };
 
@@ -135,12 +204,27 @@ fn collect_from_gpx(export_dir: &Path) -> Result<Vec<Workout>> {
         let duration =
             duration_from_gpx(path).with_context(|| format!("Parsing GPX: {display}"))?;
 
+        if duration.is_some() {
+            with_duration += 1;
+        } else {
+            no_duration += 1;
+            if sample_nodur < 5 {
+                let p = path.display();
+                dlog!("gpx_no_duration path={p} size={size}");
+                sample_nodur += 1;
+            }
+        }
+
         out.push(Workout {
             start,
             duration,
             source: format!("gpx:{file_name}"),
         });
     }
+
+    dlog!(
+        "gpx_summary seen={seen} start_fail={start_fail} empty={empty} with_duration={with_duration} no_duration={no_duration}"
+    );
 
     out.sort_by(|a, b| b.start.cmp(&a.start));
     Ok(out)
@@ -174,6 +258,8 @@ fn duration_from_gpx(path: &Path) -> Result<Option<Duration>> {
     let mut min_t: Option<DateTime<Utc>> = None;
     let mut max_t: Option<DateTime<Utc>> = None;
 
+    let mut time_count = 0usize;
+
     loop {
         match xml.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
@@ -192,20 +278,27 @@ fn duration_from_gpx(path: &Path) -> Result<Option<Duration>> {
                     && let Ok(s) = e.decode()
                     && let Ok(dt_fixed) = DateTime::parse_from_rfc3339(s.as_ref())
                 {
-                    let dt = dt_fixed.with_timezone(&Utc);
+                    time_count += 1;
 
+                    let dt = dt_fixed.with_timezone(&Utc);
                     min_t = Some(min_t.map_or(dt, |cur| cur.min(dt)));
                     max_t = Some(max_t.map_or(dt, |cur| cur.max(dt)));
                 }
             }
-            Err(_) => {
-                // If this is a malformed GPX, treat duration as unknown rather than failing the whole run.
+            Err(e) => {
+                let p = path.display();
+                dlog!("gpx_xml_error path={p} err={e}");
                 return Ok(None);
             }
             _ => {}
         }
 
         buf.clear();
+    }
+
+    if time_count == 0 {
+        let p = path.display();
+        dlog!("gpx_no_time_elements path={p}");
     }
 
     match (min_t, max_t) {
@@ -226,438 +319,79 @@ fn collect_from_db(export_dir: &Path) -> Result<Vec<Workout>> {
     let conn =
         Connection::open(&db_path).with_context(|| format!("Opening SQLite DB: {display}"))?;
 
-    let tables = list_tables(&conn)?;
-    if tables.is_empty() {
-        return Ok(Vec::new());
+    // For Amazfit/Huami exports, this is the correct *summary* table (one row per workout).
+    if table_exists(&conn, "BASE_ACTIVITY_SUMMARY")? {
+        let out = collect_from_base_activity_summary(&conn)?;
+        let total = out.len();
+        let known = out.iter().filter(|w| w.duration.is_some()).count();
+        dlog!("db_base_activity_summary total={total} known={known}");
+        return Ok(out);
     }
 
-    let mut best: Option<(i32, Vec<Workout>)> = None;
-
-    for table in tables {
-        let cols = table_columns(&conn, &table)?;
-        let candidate = build_table_candidate(&table, &cols);
-        let Some(cand) = candidate else {
-            continue;
-        };
-
-        let workouts = extract_workouts_from_table(&conn, &cand)?;
-        if workouts.len() < 3 {
-            continue;
-        }
-
-        let len_i32 = i32::try_from(workouts.len()).unwrap_or(i32::MAX);
-        let score = cand.score + (len_i32 * 3) + recency_bonus(&workouts);
-
-        match &best {
-            None => best = Some((score, workouts)),
-            Some((best_score, _)) if score > *best_score => best = Some((score, workouts)),
-            _ => {}
-        }
-    }
-
-    Ok(best.map(|(_, w)| w).unwrap_or_default())
-}
-
-fn list_tables(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-    )?;
-    let it = stmt.query_map([], |row| row.get::<_, String>(0))?;
-
-    let mut out = Vec::new();
-    for t in it {
-        out.push(t?);
-    }
-    Ok(out)
-}
-
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let sql = format!("PRAGMA table_info({})", quote_ident(table));
-    let mut stmt = conn.prepare(&sql)?;
-    let it = stmt.query_map([], |row| row.get::<_, String>(1))?;
-
-    let mut cols = Vec::new();
-    for c in it {
-        cols.push(c?);
-    }
-    Ok(cols)
-}
-
-#[derive(Debug, Clone)]
-struct TableCandidate {
-    table: String,
-    start_col: String,
-    end_col: Option<String>,
-    dur_col: Option<String>,
-    type_col: Option<String>,
-    score: i32,
-}
-
-fn build_table_candidate(table: &str, cols: &[String]) -> Option<TableCandidate> {
-    let name_score = table_name_score(table);
-
-    let start_col = best_col(cols, col_score_start)?;
-    let end_col = best_col(cols, col_score_end);
-    let dur_col = best_col(cols, col_score_duration);
-    if end_col.is_none() && dur_col.is_none() {
-        return None;
-    }
-
-    let type_col = best_col(cols, col_score_type);
-
-    let mut score = name_score;
-    score += col_score_start(&start_col);
-
-    if let Some(ec) = &end_col {
-        score += col_score_end(ec);
-    }
-    if let Some(dc) = &dur_col {
-        score += col_score_duration(dc);
-    }
-
-    if score < 6 && name_score <= 0 {
-        return None;
-    }
-
-    Some(TableCandidate {
-        table: table.to_string(),
-        start_col,
-        end_col,
-        dur_col,
-        type_col,
-        score,
-    })
-}
-
-fn extract_workouts_from_table(conn: &Connection, cand: &TableCandidate) -> Result<Vec<Workout>> {
-    let mut select_cols = vec![quote_ident(&cand.start_col)];
-
-    if let Some(ec) = &cand.end_col {
-        select_cols.push(quote_ident(ec));
-    } else if let Some(dc) = &cand.dur_col {
-        select_cols.push(quote_ident(dc));
-    }
-
-    if let Some(tc) = &cand.type_col {
-        select_cols.push(quote_ident(tc));
-    }
-
-    let sql = format!(
-        "SELECT {} FROM {} ORDER BY {} DESC LIMIT 500",
-        select_cols.join(", "),
-        quote_ident(&cand.table),
-        quote_ident(&cand.start_col),
+    anyhow::bail!(
+        "SQLite DB does not contain BASE_ACTIVITY_SUMMARY (cannot derive workout durations)."
     );
+}
 
-    let mut stmt = conn.prepare(&sql)?;
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1")?;
+    let mut rows = stmt.query([table])?;
+    Ok(rows.next()?.is_some())
+}
+
+fn collect_from_base_activity_summary(conn: &Connection) -> Result<Vec<Workout>> {
+    // START_TIME / END_TIME are epoch milliseconds (as shown in your sqlite output).
+    let sql = r#"
+        SELECT
+            START_TIME,
+            END_TIME,
+            ACTIVITY_KIND,
+            GPX_TRACK
+        FROM BASE_ACTIVITY_SUMMARY
+        ORDER BY START_TIME DESC
+        LIMIT 2000
+    "#;
+
+    let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
 
     let mut out = Vec::new();
+
     while let Some(row) = rows.next()? {
-        if let Some(w) = row_to_workout(row, cand)? {
-            out.push(w);
-        }
-    }
+        let start_ms: i64 = row.get(0)?;
+        let end_ms: i64 = row.get(1)?;
+        let activity_kind: i64 = row.get(2)?;
+        let gpx_track: Option<String> = row.get(3)?;
 
-    out.sort_by(|a, b| b.start.cmp(&a.start));
-    Ok(out)
-}
-
-fn row_to_workout(row: &Row<'_>, cand: &TableCandidate) -> Result<Option<Workout>> {
-    let start_v = row.get_ref(0)?;
-    let Some(start) = parse_datetime_value(start_v) else {
-        return Ok(None);
-    };
-
-    let duration = if cand.end_col.is_some() {
-        let end_v = row.get_ref(1)?;
-        parse_datetime_value(end_v).and_then(|e| (e > start).then_some(e - start))
-    } else {
-        let dur_v = row.get_ref(1)?;
-        parse_duration_value(dur_v)
-    };
-
-    if !plausible_start(&start) {
-        return Ok(None);
-    }
-    if let Some(d) = duration
-        && !plausible_duration(&d)
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(Workout {
-        start,
-        duration,
-        source: format!("db:{}", cand.table),
-    }))
-}
-
-fn plausible_start(dt: &DateTime<Utc>) -> bool {
-    let earliest = Utc.with_ymd_and_hms(2010, 1, 1, 0, 0, 0).unwrap();
-    let latest = Utc::now() + Duration::days(1);
-    *dt >= earliest && *dt <= latest
-}
-
-fn plausible_duration(d: &Duration) -> bool {
-    let secs = d.num_seconds();
-    (30..=24 * 60 * 60).contains(&secs)
-}
-
-fn parse_datetime_value(v: ValueRef<'_>) -> Option<DateTime<Utc>> {
-    match v {
-        ValueRef::Integer(i) => epoch_to_utc(i),
-        ValueRef::Real(f) => f64_to_i64_trunc(f).and_then(epoch_to_utc),
-        ValueRef::Text(t) => {
-            let s = std::str::from_utf8(t).ok()?.trim();
-
-            if let Ok(dt_fixed) = DateTime::parse_from_rfc3339(s) {
-                return Some(dt_fixed.with_timezone(&Utc));
-            }
-
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-            }
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-            }
-
-            if let Ok(i) = s.parse::<i64>() {
-                return epoch_to_utc(i);
-            }
-
-            None
-        }
-        ValueRef::Null | ValueRef::Blob(_) => None,
-    }
-}
-
-fn f64_to_i64_trunc(f: f64) -> Option<i64> {
-    if !f.is_finite() {
-        return None;
-    }
-    let s = format!("{:.0}", f.trunc());
-    s.parse::<i64>().ok()
-}
-
-fn epoch_to_utc(i: i64) -> Option<DateTime<Utc>> {
-    if i <= 0 {
-        return None;
-    }
-
-    let secs = if i > 1_000_000_000_000_000_000 {
-        i / 1_000_000_000
-    } else if i > 1_000_000_000_000_000 {
-        i / 1_000_000
-    } else if i > 1_000_000_000_000 {
-        i / 1_000
-    } else {
-        i
-    };
-
-    Utc.timestamp_opt(secs, 0).single()
-}
-
-fn parse_duration_value(v: ValueRef<'_>) -> Option<Duration> {
-    match v {
-        ValueRef::Integer(i) => {
-            if i < 0 {
-                return None;
-            }
-            if i >= 1_000_000 {
-                Some(Duration::milliseconds(i))
-            } else {
-                Some(Duration::seconds(i))
-            }
-        }
-        ValueRef::Real(f) => {
-            if !f.is_finite() || f.is_sign_negative() {
-                return None;
-            }
-            let ms = f64_to_i64_trunc((f * 1000.0).round())?;
-            Some(Duration::milliseconds(ms))
-        }
-        ValueRef::Text(t) => {
-            let s = std::str::from_utf8(t).ok()?.trim();
-            if let Ok(i) = s.parse::<i64>() {
-                return parse_duration_value(ValueRef::Integer(i));
-            }
-            if let Ok(f) = s.parse::<f64>() {
-                if f.is_sign_negative() {
-                    return None;
-                }
-                let ms = f64_to_i64_trunc((f * 1000.0).round())?;
-                return Some(Duration::milliseconds(ms));
-            }
-            None
-        }
-        ValueRef::Null | ValueRef::Blob(_) => None,
-    }
-}
-
-fn recency_bonus(workouts: &[Workout]) -> i32 {
-    let Some(max_start) = workouts.iter().map(|w| w.start).max() else {
-        return 0;
-    };
-
-    let age = Utc::now().signed_duration_since(max_start).num_days();
-    if age <= 7 {
-        25
-    } else if age <= 30 {
-        10
-    } else {
-        0
-    }
-}
-
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-// ---------------------------- Heuristics ---------------------------------
-
-fn table_name_score(table: &str) -> i32 {
-    let t = table.to_lowercase();
-    let mut s = 0;
-
-    for (pat, w) in [
-        ("workout", 8),
-        ("activity", 6),
-        ("training", 6),
-        ("sport", 5),
-        ("session", 5),
-        ("run", 3),
-        ("exercise", 4),
-        ("track", 2),
-    ] {
-        if t.contains(pat) {
-            s += w;
-        }
-    }
-
-    for (pat, w) in [
-        ("sample", -4),
-        ("samples", -4),
-        ("raw", -3),
-        ("debug", -4),
-        ("log", -3),
-    ] {
-        if t.contains(pat) {
-            s += w;
-        }
-    }
-
-    s
-}
-
-fn best_col<F>(cols: &[String], score_fn: F) -> Option<String>
-where
-    F: Fn(&str) -> i32,
-{
-    let mut best: Option<(&String, i32)> = None;
-
-    for c in cols {
-        let sc = score_fn(c);
-        if sc <= 0 {
+        let Some(start) = Utc.timestamp_millis_opt(start_ms).single() else {
+            dlog!("db_bad_start_ms start_ms={start_ms}");
             continue;
-        }
-        match best {
-            None => best = Some((c, sc)),
-            Some((_, best_sc)) if sc > best_sc => best = Some((c, sc)),
-            _ => {}
-        }
+        };
+        let Some(end) = Utc.timestamp_millis_opt(end_ms).single() else {
+            dlog!("db_bad_end_ms end_ms={end_ms}");
+            continue;
+        };
+
+        let duration = (end > start).then_some(end - start);
+
+        let gpx_hint = gpx_track.as_deref().unwrap_or("-");
+        let source = format!("db:BASE_ACTIVITY_SUMMARY kind={activity_kind} gpx={gpx_hint}");
+
+        out.push(Workout {
+            start,
+            duration,
+            source,
+        });
     }
 
-    best.map(|(c, _)| c.clone())
-}
-
-fn col_score_start(col: &str) -> i32 {
-    let c = col.to_lowercase();
-    let mut s = 0;
-    if c.contains("start") {
-        s += 6;
-    }
-    if c.contains("begin") {
-        s += 4;
-    }
-    if c.contains("time") {
-        s += 3;
-    }
-    if c.contains("ts") || c.contains("timestamp") {
-        s += 4;
-    }
-    if c == "timestamp" {
-        s += 2;
-    }
-    s
-}
-
-fn col_score_end(col: &str) -> i32 {
-    let c = col.to_lowercase();
-    let mut s = 0;
-    if c.contains("end") {
-        s += 6;
-    }
-    if c.contains("stop") {
-        s += 4;
-    }
-    if c.contains("finish") {
-        s += 4;
-    }
-    if c.contains("time") {
-        s += 3;
-    }
-    if c.contains("ts") || c.contains("timestamp") {
-        s += 4;
-    }
-    s
-}
-
-fn col_score_duration(col: &str) -> i32 {
-    let c = col.to_lowercase();
-    let mut s = 0;
-    if c.contains("duration") {
-        s += 8;
-    }
-    if c.contains("elapsed") {
-        s += 5;
-    }
-    if c.contains("total") && c.contains("time") {
-        s += 5;
-    }
-    if c.contains("moving") && c.contains("time") {
-        s += 4;
-    }
-    if c.ends_with("_ms") {
-        s += 3;
-    }
-    if c.ends_with("_sec") || c.ends_with("_secs") {
-        s += 3;
-    }
-    s
-}
-
-fn col_score_type(col: &str) -> i32 {
-    let c = col.to_lowercase();
-    let mut s = 0;
-    if c == "type" {
-        s += 5;
-    }
-    if c.contains("sport") {
-        s += 5;
-    }
-    if c.contains("activity") {
-        s += 4;
-    }
-    if c.contains("name") {
-        s += 2;
-    }
-    s
+    Ok(out)
 }
 
 // ---------------------------- Merge & formatting ---------------------------------
 
 fn merge_by_start_minute(workouts: Vec<Workout>) -> Vec<Workout> {
+    // Key by "start minute" to dedupe GPX vs DB entries for the same workout.
     let mut by_key: HashMap<i64, Workout> = HashMap::new();
 
     let mut sorted = workouts;
@@ -687,6 +421,7 @@ fn choose_better(a: &Workout, b: &Workout) -> bool {
         (false, true) => true,
         (true, false) => false,
         _ => {
+            // Prefer DB over GPX when both have durations (DB is authoritative here).
             let a_db = a.source.starts_with("db:");
             let b_db = b.source.starts_with("db:");
             b_db && !a_db

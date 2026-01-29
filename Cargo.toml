@@ -1,0 +1,21 @@
+[package]
+name = "roudenn"
+version = "0.1.0"
+edition = "2024"
+
+description = "Extract workout sessions from a Gadgetbridge export (Amazfit)."
+license = "UNLICENSED"
+repository = "https://github.com/MathieuMoalic/roudenn"
+readme = "README.md"
+keywords = ["gadgetbridge", "amazfit", "gpx", "sqlite", "fitness"]
+categories = ["command-line-utilities", "parsing"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+walkdir = "2.5"
+chrono = { version = "0.4", features = ["clock"] }
+regex = "1.10"
+once_cell = "1.19"
+quick-xml = "0.39"
+rusqlite = { version = "0.32", features = ["bundled"] }

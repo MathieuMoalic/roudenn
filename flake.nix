@@ -49,6 +49,40 @@
       '';
     };
 
+    runPostgres = pkgs.writeShellApplication {
+      name = "run-postgres";
+      runtimeInputs = with pkgs; [postgresql coreutils];
+      text = ''
+            set -euo pipefail
+
+            ROOT="$(pwd)"
+            DATA="''${ROOT}/.pg/data"
+            SOCKDIR="''${ROOT}/.pg"
+
+            mkdir -p "''${DATA}" "''${SOCKDIR}"
+
+            : "''${PGADDR:=127.0.0.1}"
+            : "''${PGPORT:=5432}"
+
+            if [ ! -f "''${DATA}/PG_VERSION" ]; then
+              initdb -D "''${DATA}" --no-locale --encoding=UTF8
+
+              cat >> "''${DATA}/pg_hba.conf" <<'EOF'
+        local   all             all                                     trust
+        host    all             all             127.0.0.1/32            trust
+        host    all             all             ::1/128                 trust
+        EOF
+
+              # Keep config minimal; socket dir is set via -k below (absolute).
+              cat >> "''${DATA}/postgresql.conf" <<'EOF'
+        timezone = 'Europe/Warsaw'
+        EOF
+            fi
+
+            exec postgres -D "''${DATA}" -h "''${PGADDR}" -p "''${PGPORT}" -k "''${SOCKDIR}"
+      '';
+    };
+
     shell = pkgs.mkShell {
       name = "dev-shell";
       packages = with pkgs; [
@@ -70,11 +104,21 @@
   in {
     devShells.${system}.default = shell;
 
-    packages.${system}.run-grafana = runGrafana;
+    packages.${system} = {
+      run-grafana = runGrafana;
+      run-postgres = runPostgres;
+    };
 
-    apps.${system}.grafana = {
-      type = "app";
-      program = "${runGrafana}/bin/run-grafana";
+    apps.${system} = {
+      postgres = {
+        type = "app";
+        program = "${runPostgres}/bin/run-postgres";
+      };
+
+      grafana = {
+        type = "app";
+        program = "${runGrafana}/bin/run-grafana";
+      };
     };
   };
 }

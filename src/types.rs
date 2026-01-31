@@ -1,12 +1,5 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-
-#[derive(Debug, Clone)]
-pub struct Workout {
-    pub start: DateTime<Utc>,
-    pub duration: Option<Duration>,
-    pub source: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct WorkoutSummary {

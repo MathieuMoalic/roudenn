@@ -1,21 +1,11 @@
-use crate::types::Workout;
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration, FixedOffset, Utc};
-use regex::Regex;
-use std::collections::HashMap;
+use chrono::Duration;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 use zip::ZipArchive;
-
-static TS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches Gadgetbridge's filename timestamp style:
-    // 2026-01-29T08_25_59+01_00  (underscores instead of colons)
-    Regex::new(r"(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}[+-]\d{2}_\d{2})").unwrap()
-});
 
 #[macro_export]
 macro_rules! dlog {
@@ -170,52 +160,6 @@ fn looks_like_export(dir: &Path) -> bool {
         || dir.join("database").is_dir()
         || dir.join("gadgetbridge.json").is_file()
         || dir.join("database").join("Gadgetbridge").is_file()
-}
-
-pub fn parse_start_from_filename(file_name: &str) -> Option<DateTime<Utc>> {
-    let caps = TS_RE.captures(file_name)?;
-    let raw = caps.get(1)?.as_str();
-
-    let rfc3339 = raw.replace('_', ":");
-    let dt_fixed: DateTime<FixedOffset> = DateTime::parse_from_rfc3339(&rfc3339).ok()?;
-    Some(dt_fixed.with_timezone(&Utc))
-}
-
-pub fn merge_by_start_minute(workouts: Vec<Workout>) -> Vec<Workout> {
-    let mut by_key: HashMap<i64, Workout> = HashMap::new();
-
-    let mut sorted = workouts;
-    sorted.sort_by(|a, b| b.start.cmp(&a.start));
-
-    for w in sorted {
-        let key = w.start.timestamp() / 60;
-        match by_key.get(&key) {
-            None => {
-                by_key.insert(key, w);
-            }
-            Some(existing) => {
-                if choose_better(existing, &w) {
-                    by_key.insert(key, w);
-                }
-            }
-        }
-    }
-
-    let mut out = by_key.into_values().collect::<Vec<_>>();
-    out.sort_by(|a, b| b.start.cmp(&a.start));
-    out
-}
-
-fn choose_better(a: &Workout, b: &Workout) -> bool {
-    match (a.duration.is_some(), b.duration.is_some()) {
-        (false, true) => true,
-        (true, false) => false,
-        _ => {
-            let a_db = a.source.starts_with("db:");
-            let b_db = b.source.starts_with("db:");
-            b_db && !a_db
-        }
-    }
 }
 
 pub fn format_duration(d: Duration) -> String {

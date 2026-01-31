@@ -1,4 +1,4 @@
-use crate::types::{Workout, WorkoutSummary};
+use crate::types::WorkoutSummary;
 use crate::{dlog, utils::map_android_raw_details_to_export};
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
@@ -6,22 +6,6 @@ use rusqlite::Connection;
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::Path;
-
-pub fn collect_from_db(export_dir: &Path) -> Result<Vec<Workout>> {
-    let summaries = read_base_activity_summary(export_dir, false)?;
-    let mut out = Vec::with_capacity(summaries.len());
-
-    for s in summaries {
-        let duration = (s.end > s.start).then_some(s.end - s.start);
-        out.push(Workout {
-            start: s.start,
-            duration,
-            source: format!("db:BASE_ACTIVITY_SUMMARY kind={}", s.activity_kind),
-        });
-    }
-
-    Ok(out)
-}
 
 pub fn read_base_activity_summary(
     export_dir: &Path,

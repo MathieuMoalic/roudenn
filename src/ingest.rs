@@ -3,22 +3,21 @@ use crate::dlog;
 use crate::gpx::parse_gpx_points;
 use crate::types::{GpxPoint, WorkoutSummary};
 use crate::utils::{duration_seconds_i32, e7_to_degrees, map_android_gpx_to_export};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use postgres::{Client, NoTls};
 use std::path::Path;
 
-pub fn ingest(
-    export_dir: &Path,
-    pg_url: &str,
-    with_points: bool,
-    store_raw_details: bool,
-) -> Result<()> {
-    let mut pg = Client::connect(pg_url, NoTls).context("Connecting to PostgreSQL")?;
+pub fn ingest(export_dir: &Path, pg_url: &str) -> Result<()> {
+    // Always store raw details + import points now.
+    let store_raw_details = true;
+    let with_points = true;
+
+    let mut pg = connect_or_create_db(pg_url)?;
     ensure_pg_schema(&mut pg)?;
 
     let summaries = read_base_activity_summary(export_dir, store_raw_details)?;
     let total = summaries.len();
-    dlog!("found summaries={total}");
+    tracing::info!(summaries = total, "found workouts");
 
     let mut inserted_or_updated = 0usize;
     let mut points_imported = 0usize;
@@ -32,18 +31,20 @@ pub fn ingest(
             let Some(android_path) = s.gpx_track_android.as_deref() else {
                 continue;
             };
+
             let Some(gpx_path) = map_android_gpx_to_export(export_dir, android_path) else {
                 dlog!("gpx_map_failed android_path={android_path}");
                 continue;
             };
+
             if !gpx_path.exists() {
-                let p = gpx_path.display();
-                dlog!("gpx_missing path={p}");
+                tracing::warn!(path = %gpx_path.display(), "gpx file referenced by db is missing");
                 continue;
             }
 
             let pts = parse_gpx_points(&gpx_path)
                 .with_context(|| format!("Parsing GPX points: {}", gpx_path.display()))?;
+
             if pts.is_empty() {
                 continue;
             }
@@ -62,6 +63,111 @@ pub fn ingest(
     );
 
     Ok(())
+}
+
+/// Connect to pg_url. If the database in the URL doesn't exist, create it and retry.
+///
+/// This requires privileges to CREATE DATABASE.
+fn connect_or_create_db(pg_url: &str) -> Result<Client> {
+    match Client::connect(pg_url, NoTls) {
+        Ok(pg) => return Ok(pg),
+        Err(e) => {
+            if is_db_missing(&e) {
+                // continue below
+                tracing::warn!(err = %e, "database does not exist; attempting to create it");
+            } else {
+                return Err(e).context("Connecting to PostgreSQL");
+            }
+        }
+    }
+
+    let (db_name, admin_url_postgres, admin_url_template1) = admin_urls_for_create_db(pg_url)?;
+
+    let mut admin = Client::connect(&admin_url_postgres, NoTls)
+        .or_else(|_| Client::connect(&admin_url_template1, NoTls))
+        .context("Connecting to maintenance DB (postgres/template1) to create target DB")?;
+
+    if !database_exists(&mut admin, &db_name)? {
+        tracing::info!(db = %db_name, "creating database");
+        create_database(&mut admin, &db_name)?;
+    } else {
+        tracing::info!(db = %db_name, "database already exists");
+    }
+
+    Client::connect(pg_url, NoTls).context("Connecting to PostgreSQL after creating database")
+}
+
+fn is_db_missing(e: &postgres::Error) -> bool {
+    e.as_db_error()
+        .map(|d| d.code().code() == "3D000") // invalid_catalog_name (db does not exist)
+        .unwrap_or(false)
+}
+
+fn database_exists(pg: &mut Client, db_name: &str) -> Result<bool> {
+    Ok(pg
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&db_name])?
+        .is_some())
+}
+
+fn create_database(pg: &mut Client, db_name: &str) -> Result<()> {
+    // Avoid SQL injection: only allow simple identifiers.
+    if db_name.is_empty()
+        || !db_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        bail!("Refusing to create database with unsafe name: {db_name:?}");
+    }
+
+    // CREATE DATABASE has no IF NOT EXISTS, so we check first; still handle race.
+    let sql = format!("CREATE DATABASE \"{db_name}\"");
+    match pg.batch_execute(&sql) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 42P04 = duplicate_database
+            if e.as_db_error()
+                .map(|d| d.code().code() == "42P04")
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(e).context("Creating database")
+            }
+        }
+    }
+}
+
+/// Returns (dbname, admin_url_postgres, admin_url_template1).
+///
+/// Supports URI-style URLs like:
+/// postgres://127.0.0.1:5432/fitness?sslmode=disable
+fn admin_urls_for_create_db(pg_url: &str) -> Result<(String, String, String)> {
+    let (base, query) = match pg_url.split_once('?') {
+        Some((a, b)) => (a, Some(b)),
+        None => (pg_url, None),
+    };
+
+    let slash = base
+        .rfind('/')
+        .context("pg_url must include a database name (e.g. .../fitness)")?;
+    let db_name = &base[slash + 1..];
+    if db_name.is_empty() {
+        bail!("pg_url must include a database name (e.g. .../fitness)");
+    }
+
+    let prefix = &base[..slash + 1]; // keep trailing '/'
+
+    let mut admin_postgres = format!("{prefix}postgres");
+    let mut admin_template1 = format!("{prefix}template1");
+
+    if let Some(q) = query {
+        admin_postgres.push('?');
+        admin_postgres.push_str(q);
+        admin_template1.push('?');
+        admin_template1.push_str(q);
+    }
+
+    Ok((db_name.to_string(), admin_postgres, admin_template1))
 }
 
 fn ensure_pg_schema(pg: &mut Client) -> Result<()> {
@@ -198,8 +304,7 @@ fn upsert_workout(pg: &mut Client, s: &WorkoutSummary) -> Result<i64> {
         )
         .context("Upserting workout")?;
 
-    let id: i64 = row.get(0);
-    Ok(id)
+    Ok(row.get(0))
 }
 
 fn import_points_for_workout(pg: &mut Client, workout_id: i64, points: &[GpxPoint]) -> Result<()> {

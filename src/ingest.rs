@@ -54,7 +54,7 @@ pub fn ingest(export_dir: &Path, pg_url: &str) -> Result<()> {
             points_imported += pts.len();
         }
     }
-
+    refresh_workout_distance_matview(&mut pg)?;
     tracing::info!(
         workouts_upserted = inserted_or_updated,
         workouts_with_points = workouts_with_points,
@@ -169,6 +169,83 @@ fn admin_urls_for_create_db(pg_url: &str) -> Result<(String, String, String)> {
 
     Ok((db_name.to_string(), admin_postgres, admin_template1))
 }
+fn ensure_workout_distance_matview(pg: &mut Client) -> Result<()> {
+    // Does the materialized view already exist?
+    let exists = pg
+        .query_opt(
+            r#"
+            SELECT 1
+            FROM pg_matviews
+            WHERE schemaname = 'public'
+              AND matviewname = 'workout_distance_m'
+            "#,
+            &[],
+        )
+        .context("Checking for materialized view public.workout_distance_m")?
+        .is_some();
+
+    if exists {
+        tracing::info!("materialized view workout_distance_m already exists");
+        return Ok(());
+    }
+
+    tracing::info!("creating materialized view workout_distance_m");
+
+    // Compute per-workout distance (meters) by summing haversine distances between consecutive points.
+    pg.batch_execute(
+        r#"
+        CREATE MATERIALIZED VIEW public.workout_distance_m AS
+        WITH p AS (
+          SELECT
+            workout_id,
+            idx,
+            lat,
+            lon,
+            LAG(lat) OVER (PARTITION BY workout_id ORDER BY idx) AS lat0,
+            LAG(lon) OVER (PARTITION BY workout_id ORDER BY idx) AS lon0
+          FROM public.workout_points
+        ),
+        seg AS (
+          SELECT
+            workout_id,
+            2.0 * 6371000.0 * asin(
+              sqrt(
+                power(sin(radians(lat - lat0) / 2.0), 2)
+                + cos(radians(lat0)) * cos(radians(lat))
+                  * power(sin(radians(lon - lon0) / 2.0), 2)
+              )
+            ) AS dist_m
+          FROM p
+          WHERE lat0 IS NOT NULL AND lon0 IS NOT NULL
+        )
+        SELECT
+          workout_id,
+          SUM(dist_m) AS distance_m
+        FROM seg
+        GROUP BY workout_id;
+        "#,
+    )
+    .context("Creating materialized view public.workout_distance_m")?;
+
+    // Required for REFRESH ... CONCURRENTLY and also useful for joins.
+    pg.batch_execute(
+        r#"
+        CREATE UNIQUE INDEX workout_distance_m_workout_id_idx
+          ON public.workout_distance_m (workout_id);
+        "#,
+    )
+    .context("Creating unique index on public.workout_distance_m")?;
+
+    Ok(())
+}
+
+fn refresh_workout_distance_matview(pg: &mut Client) -> Result<()> {
+    // Concurrent refresh avoids blocking reads in Grafana.
+    // NOTE: This must not run inside an explicit transaction.
+    pg.batch_execute("REFRESH MATERIALIZED VIEW CONCURRENTLY public.workout_distance_m;")
+        .context("Refreshing materialized view public.workout_distance_m")?;
+    Ok(())
+}
 
 fn ensure_pg_schema(pg: &mut Client) -> Result<()> {
     pg.batch_execute(
@@ -224,6 +301,7 @@ fn ensure_pg_schema(pg: &mut Client) -> Result<()> {
         ",
     )
     .context("Ensuring PostgreSQL schema")?;
+    ensure_workout_distance_matview(pg)?;
 
     Ok(())
 }

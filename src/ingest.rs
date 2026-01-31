@@ -54,8 +54,11 @@ pub fn ingest(
         }
     }
 
-    eprintln!(
-        "ingest done: workouts_upserted={inserted_or_updated} workouts_with_points={workouts_with_points} points_imported={points_imported}"
+    tracing::info!(
+        workouts_upserted = inserted_or_updated,
+        workouts_with_points = workouts_with_points,
+        points_imported = points_imported,
+        "ingest done"
     );
 
     Ok(())

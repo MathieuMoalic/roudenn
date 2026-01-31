@@ -24,7 +24,11 @@ pub fn ingest(export_dir: &Path, pg_url: &str) -> Result<()> {
     let mut workouts_with_points = 0usize;
 
     for s in summaries {
-        let workout_id = upsert_workout(&mut pg, &s)?;
+        let Some(activity) = activity_label(s.activity_kind) else {
+            continue; // ignore all other activities
+        };
+
+        let workout_id = upsert_workout(&mut pg, &s, activity)?;
         inserted_or_updated += 1;
 
         if with_points {
@@ -301,12 +305,38 @@ fn ensure_pg_schema(pg: &mut Client) -> Result<()> {
         ",
     )
     .context("Ensuring PostgreSQL schema")?;
+
+    pg.batch_execute(
+        r#"
+    ALTER TABLE workouts
+      ADD COLUMN IF NOT EXISTS activity text NOT NULL DEFAULT 'other';
+
+    UPDATE workouts
+    SET activity = CASE activity_kind
+      WHEN 67109041 THEN 'outdoor_running'
+      WHEN 256      THEN 'treadmill'
+      ELSE 'other'
+    END
+    WHERE activity = 'other';
+
+    CREATE INDEX IF NOT EXISTS workouts_activity_idx ON workouts (activity);
+    "#,
+    )?;
+
     ensure_workout_distance_matview(pg)?;
 
     Ok(())
 }
 
-fn upsert_workout(pg: &mut Client, s: &WorkoutSummary) -> Result<i64> {
+fn activity_label(kind: i32) -> Option<&'static str> {
+    match kind {
+        67109041 => Some("outdoor_running"),
+        256 => Some("treadmill"),
+        _ => None,
+    }
+}
+
+fn upsert_workout(pg: &mut Client, s: &WorkoutSummary, activity: &str) -> Result<i64> {
     let duration_s_i32 = duration_seconds_i32(s.end - s.start);
     let (base_lon, base_lat) = e7_to_degrees(s.base_longitude_e7, s.base_latitude_e7);
 
@@ -316,9 +346,9 @@ fn upsert_workout(pg: &mut Client, s: &WorkoutSummary) -> Result<i64> {
 
     let row = pg
         .query_one(
-            r"
+            r#"
             INSERT INTO workouts (
-              device_id, user_id, activity_kind,
+              device_id, user_id, activity_kind, activity,
               start_time, end_time, duration_s,
               name,
               base_longitude_e7, base_latitude_e7, base_altitude,
@@ -329,19 +359,20 @@ fn upsert_workout(pg: &mut Client, s: &WorkoutSummary) -> Result<i64> {
               updated_at
             )
             VALUES (
-              $1, $2, $3,
-              $4, $5, $6,
-              $7,
-              $8, $9, $10,
-              $11, $12,
-              $13, $14,
-              $15, $16,
-              $17, $18,
+              $1, $2, $3, $4,
+              $5, $6, $7,
+              $8,
+              $9, $10, $11,
+              $12, $13,
+              $14, $15,
+              $16, $17,
+              $18, $19,
               now()
             )
             ON CONFLICT (device_id, start_time) DO UPDATE SET
               user_id = EXCLUDED.user_id,
               activity_kind = EXCLUDED.activity_kind,
+              activity = EXCLUDED.activity,
               end_time = EXCLUDED.end_time,
               duration_s = EXCLUDED.duration_s,
               name = EXCLUDED.name,
@@ -358,26 +389,27 @@ fn upsert_workout(pg: &mut Client, s: &WorkoutSummary) -> Result<i64> {
               raw_details = EXCLUDED.raw_details,
               updated_at = now()
             RETURNING id
-            ",
+            "#,
             &[
-                &s.device_id,
-                &s.user_id,
-                &s.activity_kind,
-                &s.start,
-                &s.end,
-                &duration_s_i32,
-                &s.name,
-                &s.base_longitude_e7,
-                &s.base_latitude_e7,
-                &s.base_altitude,
-                &base_lon,
-                &base_lat,
-                &s.gpx_track_android,
-                &s.raw_details_android,
-                &s.summary_data_raw,
-                &summary_json,
-                &raw_summary_data,
-                &raw_details,
+                &s.device_id,           // $1
+                &s.user_id,             // $2
+                &s.activity_kind,       // $3
+                &activity,              // $4
+                &s.start,               // $5
+                &s.end,                 // $6
+                &duration_s_i32,        // $7
+                &s.name,                // $8
+                &s.base_longitude_e7,   // $9
+                &s.base_latitude_e7,    // $10
+                &s.base_altitude,       // $11
+                &base_lon,              // $12
+                &base_lat,              // $13
+                &s.gpx_track_android,   // $14
+                &s.raw_details_android, // $15
+                &s.summary_data_raw,    // $16
+                &summary_json,          // $17
+                &raw_summary_data,      // $18
+                &raw_details,           // $19
             ],
         )
         .context("Upserting workout")?;

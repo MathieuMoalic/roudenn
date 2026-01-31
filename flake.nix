@@ -95,9 +95,8 @@
         cargo-watch
         sqlite
 
-        # optional but convenient:
         grafana
-        runGrafana
+        postgresql
       ];
       RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
     };
